@@ -16,3 +16,8 @@ sanspo.com
 hochi.co.jp
 oricon.co.jp
 natalie.mu
+# 日本の媒体だが .jp ではないもの（coverage_jp.py で拾うため）
+news.livedoor.com
+jp.reuters.com
+jp.wsj.com
+forbesjapan.com
