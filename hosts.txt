@@ -1,0 +1,18 @@
+# audit の結果で実在・件数を確認してから編集すること（行頭#はコメント）
+# 一般紙・通信社
+asahi.com
+mainichi.jp
+yomiuri.co.jp
+sankei.com
+nikkei.com
+jiji.com
+kyodonews.jp
+nhk.or.jp
+# スポーツ紙・芸能
+sponichi.co.jp
+daily.co.jp
+nikkansports.com
+sanspo.com
+hochi.co.jp
+oricon.co.jp
+natalie.mu
