@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
-"""Infini-News の注釈ファイル（言語・トピック）だけで、日本語記事の総数とジャンル別件数を数える。
+r"""Infini-News の注釈ファイル（言語・トピック）だけで、日本語記事の総数とジャンル別件数を数える。
+同じフォルダに progress_common.py が必要。
 
-記事本文のファイルは読まない。注釈ファイルは月ごとに1つで、全記事分の行がある。
+  uv add duckdb
+  $env:HF_TOKEN="hf_..."      # 無いとHugging Faceのレート制限(429)にすぐ当たる
+  uv run python infini_overview.py count
+  uv run python infini_overview.py count --months 2024-01:2024-12
+  uv run python infini_overview.py topics --months 2024-01
 
-  pip install duckdb
-  # 1) 全117か月の「月別 全記事数 / 日本語記事数」。言語列だけを読むので軽い想定
-  python infini_overview.py count
-  # 2) 日本語記事のIPTCジャンル別件数（月ごと）。2つの注釈ファイルを結合するので重い
-  python infini_overview.py topics --months 2024-01
-  python infini_overview.py topics --months 2024-01:2024-12
+進捗: 画面に「[何件目/全体] 月 結果 秒数 | 経過 | 残り約」を出す。同じ内容を out/progress.log にも保存する。
+      別のPowerShellで  Get-Content out\progress.log -Wait  を実行すると、途中経過を見続けられる。
 
 注意:
-- 未実行です（作成環境ではネットワーク不可）。まず count と topics の1か月分で時間を測ってください。
+- 未実行のコードです。止まっても、同じコマンドを再実行すれば済んだ月を飛ばして続きから進む。
 - lang は CommonLingua のラベル（日本語は 'jpn' のはず。0件ならラベルを確認）。
-- 件数には再クロール・転載の重複が含まれます。ホスト別の内訳はこのスクリプトでは出ません
-  （ホストは記事ファイル側の列なので、infini_fetch.py の audit を使う）。
-- IPTCのトピックは多言語分類器による予測で、日本語での精度は未検証です。
-- HF_TOKEN 環境変数があれば認証付きで読みます。
+- 件数には再クロール・転載の重複が含まれる。IPTCトピックの日本語での精度は未検証。
 """
 import argparse
 import os
-import sys
 import time
 
 import duckdb
+
+from progress_common import Tracker, log, run_sql, set_log
 
 ROOT = "hf://datasets/ruggsea/infini-news-corpus/annotations"
 
@@ -34,6 +33,9 @@ def connect():
     token = os.environ.get("HF_TOKEN")
     if token:
         con.execute(f"CREATE SECRET hf (TYPE HUGGINGFACE, TOKEN '{token}')")
+        log("HF_TOKEN を使用します")
+    else:
+        log("警告: HF_TOKEN が未設定です。レート制限に当たりやすくなります")
     return con
 
 
@@ -57,30 +59,53 @@ def parse_months(spec):
 
 
 def count(args):
-    os.makedirs(args.out, exist_ok=True)
-    out = os.path.join(args.out, "count_by_month.csv")
-    t = time.time()
-    sql = f"""
-    COPY (
-      SELECT year, month,
-             count(*) AS n_all,
-             count(*) FILTER (WHERE lang = 'jpn') AS n_jpn
-      FROM read_parquet('{ROOT}/language/year=*/month=*/part-00000.parquet',
-                        hive_partitioning = true)
-      GROUP BY 1, 2 ORDER BY 1, 2
-    ) TO '{out}' (HEADER, DELIMITER ',')
-    """
-    connect().execute(sql)
-    print(f"ok {time.time() - t:.0f}s -> {out}")
+    d = os.path.join(args.out, "count")
+    os.makedirs(d, exist_ok=True)
+    months = parse_months(args.months)
+    log(f"count 開始: {len(months)}か月分")
+    con = connect()
+    tr = Tracker(len(months))
+    for y, m in months:
+        label = f"{y}-{m:02d}"
+        out = os.path.join(d, f"count_{label}.csv")
+        if os.path.exists(out):
+            tr.skipped(label)
+            continue
+        t = time.time()
+        f = f"{ROOT}/language/year={y}/month={m:02d}/part-00000.parquet"
+        sql = f"""
+        COPY (
+          SELECT {y} AS year, {m} AS month,
+                 count(*) AS n_all,
+                 count(*) FILTER (WHERE lang = 'jpn') AS n_jpn
+          FROM read_parquet('{f}')
+        ) TO '{out}' (HEADER, DELIMITER ',')
+        """
+        r = run_sql(con, sql, label)
+        tr.done(label, r, time.time() - t)
+    merged = os.path.join(args.out, "count_by_month.csv")
+    con.execute(
+        f"COPY (SELECT * FROM read_csv('{d}/count_*.csv') ORDER BY year, month) "
+        f"TO '{merged}' (HEADER, DELIMITER ',')"
+    )
+    n_all, n_jpn = con.execute(
+        f"SELECT sum(n_all), sum(n_jpn) FROM read_csv('{merged}')"
+    ).fetchone()
+    log(f"統合: {merged}")
+    log(f"合計: 全記事 {n_all:,} 件 / 日本語 {n_jpn:,} 件（集計できた月のみ）")
 
 
 def topics(args):
     os.makedirs(args.out, exist_ok=True)
+    months = parse_months(args.months)
+    log(f"topics 開始: {len(months)}か月分")
     con = connect()
-    for y, m in parse_months(args.months):
-        out = os.path.join(args.out, f"topics_{y}-{m:02d}.csv")
+    tr = Tracker(len(months))
+    for y, m in months:
+        label = f"{y}-{m:02d}"
+        out = os.path.join(args.out, f"topics_{label}.csv")
         if os.path.exists(out):
-            print(f"skip {out}")
+            tr.skipped(label)
             continue
         t = time.time()
         lang = f"{ROOT}/language/year={y}/month={m:02d}/part-00000.parquet"
@@ -94,20 +119,19 @@ def topics(args):
           GROUP BY 1 ORDER BY n DESC
         ) TO '{out}' (HEADER, DELIMITER ',')
         """
-        try:
-            con.execute(sql)
-            print(f"{y}-{m:02d}: ok {time.time() - t:.0f}s -> {out}")
-        except Exception as e:
-            print(f"{y}-{m:02d}: NG {e}", file=sys.stderr)
+        r = run_sql(con, sql, label)
+        tr.done(label, r, time.time() - t)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("count")
+    c.add_argument("--months", default="2016-08:2026-04")
     c.add_argument("--out", default="out")
     tp = sub.add_parser("topics")
     tp.add_argument("--months", required=True, help="2024-01 または 2024-01:2024-12")
     tp.add_argument("--out", default="out")
     a = p.parse_args()
+    set_log(os.path.join(a.out, "progress.log"))
     count(a) if a.cmd == "count" else topics(a)

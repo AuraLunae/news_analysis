@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Infini-News (ruggsea/infini-news-corpus v2) から日本語ニュースを取得する。
+r"""Infini-News (ruggsea/infini-news-corpus v2) から日本語ニュースを取得する。
+同じフォルダに progress_common.py が必要。
 
-使い方（まず audit、結果を見てから extract）:
-  pip install duckdb
+  uv add duckdb
+  $env:HF_TOKEN="hf_..."
   # 1) カバレッジ監査: 本文列を読まず、ホスト別の件数・公開日欠損・重複を数える
-  python infini_fetch.py audit --months 2024-01
+  uv run python infini_fetch.py audit --months 2024-01
   # 2) 本抽出: 対象ホストの全記事を、本文の先頭だけ残して保存する
-  python infini_fetch.py extract --months 2024-01 --hosts hosts.txt --limit 2000   # 動作確認
-  python infini_fetch.py extract --months 2016-08:2026-04 --hosts hosts.txt        # 全期間
+  uv run python infini_fetch.py extract --months 2024-01 --hosts hosts.txt --limit 2000   # 動作確認
+  uv run python infini_fetch.py extract --months 2016-08:2026-04 --hosts hosts.txt        # 全期間
+
+進捗: 画面に「[何件目/全体] 月 結果 秒数 | 経過 | 残り約」を出す。同じ内容を out/progress.log にも保存する。
+      別のPowerShellで  Get-Content out\progress.log -Wait  を実行すると、途中経過を見続けられる。
 
 注意:
 - パーティションは「クロール月」であり、記事の公開月ではない。公開日は publish_date 列（欠損あり）。
-- 重複（再クロール・転載）は残っている。分母は text_xxhash64 などで別途集計する。
-- 抽出時は分母を保つため、キーワードによる絞り込みはしない。
-- 未実行のコードです（作成環境ではネットワーク不可）。最初は1か月＋--limit で試してください。
-- HF_TOKEN 環境変数があれば認証付きで読む（匿名だとレート制限にかかることがある）。
+- 重複（再クロール・転載）は残っている。抽出時は分母を保つため、キーワードでは絞らない。
+- 未実行のコードです。止まっても、同じコマンドを再実行すれば済んだ月を飛ばして続きから進む。
 """
 import argparse
 import os
-import sys
 import time
 
 import duckdb
+
+from progress_common import Tracker, log, run_sql, set_log
 
 BASE = "hf://datasets/ruggsea/infini-news-corpus/data/year={y}/month={m:02d}/part-*.parquet"
 
@@ -51,27 +54,23 @@ def connect():
     token = os.environ.get("HF_TOKEN")
     if token:
         con.execute(f"CREATE SECRET hf (TYPE HUGGINGFACE, TOKEN '{token}')")
+        log("HF_TOKEN を使用します")
+    else:
+        log("警告: HF_TOKEN が未設定です。レート制限に当たりやすくなります")
     return con
-
-
-def run_with_retry(con, sql, tries=3):
-    for i in range(tries):
-        try:
-            con.execute(sql)
-            return True
-        except Exception as e:  # ネットワーク断・レート制限など
-            print(f"  失敗({i + 1}/{tries}): {e}", file=sys.stderr)
-            time.sleep(10 * (i + 1))
-    return False
 
 
 def audit(args):
     os.makedirs(args.out, exist_ok=True)
+    months = parse_months(args.months)
+    log(f"audit 開始: {len(months)}か月分")
     con = connect()
-    for y, m in parse_months(args.months):
-        out = os.path.join(args.out, f"audit_{y}-{m:02d}.csv")
+    tr = Tracker(len(months))
+    for y, m in months:
+        label = f"{y}-{m:02d}"
+        out = os.path.join(args.out, f"audit_{label}.csv")
         if os.path.exists(out):
-            print(f"skip {out}")
+            tr.skipped(label)
             continue
         t = time.time()
         sql = f"""
@@ -86,23 +85,25 @@ def audit(args):
           GROUP BY 1 ORDER BY n DESC
         ) TO '{out}' (HEADER, DELIMITER ',')
         """
-        ok = run_with_retry(con, sql)
-        print(f"{y}-{m:02d}: {'ok' if ok else 'NG'} {time.time() - t:.0f}s -> {out}")
+        r = run_sql(con, sql, label)
+        tr.done(label, r, time.time() - t)
 
 
 def extract(args):
     os.makedirs(args.out, exist_ok=True)
     with open(args.hosts, encoding="utf-8") as f:
         hosts = [h.strip() for h in f if h.strip() and not h.startswith("#")]
-    cond = " OR ".join(
-        f"url_hostname = '{h}' OR url_hostname LIKE '%.{h}'" for h in hosts
-    )
+    cond = " OR ".join(f"url_hostname = '{h}' OR url_hostname LIKE '%.{h}'" for h in hosts)
     lim = f"LIMIT {int(args.limit)}" if args.limit else ""
+    months = parse_months(args.months)
+    log(f"extract 開始: {len(months)}か月分、対象ホスト {len(hosts)}件")
     con = connect()
-    for y, m in parse_months(args.months):
-        out = os.path.join(args.out, f"news_{y}-{m:02d}.parquet")
+    tr = Tracker(len(months))
+    for y, m in months:
+        label = f"{y}-{m:02d}"
+        out = os.path.join(args.out, f"news_{label}.parquet")
         if os.path.exists(out):
-            print(f"skip {out}")
+            tr.skipped(label)
             continue
         tmp = out + ".part"
         t = time.time()
@@ -117,12 +118,11 @@ def extract(args):
           {lim}
         ) TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)
         """
-        ok = run_with_retry(con, sql)
-        if ok:
+        r = run_sql(con, sql, label)
+        if r == "ok":
             os.replace(tmp, out)
-            print(f"{y}-{m:02d}: ok {time.time() - t:.0f}s {os.path.getsize(out) / 1e6:.1f}MB")
-        else:
-            print(f"{y}-{m:02d}: NG（再実行すると続きから）")
+            r = f"ok {os.path.getsize(out) / 1e6:.1f}MB"
+        tr.done(label, r, time.time() - t)
 
 
 if __name__ == "__main__":
@@ -136,4 +136,5 @@ if __name__ == "__main__":
     sub.choices["extract"].add_argument("--head", type=int, default=1500, help="保存する本文の先頭文字数")
     sub.choices["extract"].add_argument("--limit", type=int, default=0, help="動作確認用の件数上限")
     a = p.parse_args()
+    set_log(os.path.join(a.out, "progress.log"))
     audit(a) if a.cmd == "audit" else extract(a)
